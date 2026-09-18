@@ -136,10 +136,15 @@ def test_duplicate_idempotency_key_returns_original_and_is_not_reenqueued(server
     assert len(delivered) == before + 1  # exactly one outbound delivery ever
 
 
-# ------------------------------------------------- retries with 1/2/4 backoff
+# ------------------------------------------------- retries with 1/2 backoff
+# (the 4s backoff of the 4th attempt is pre-empted by the circuit breaker:
+# the 3rd consecutive failure opens the target's breaker for ~10s, so the
+# last attempt waits for the cool-down instead — see the breaker tests)
 
-def test_retries_use_1_2_4_backoff_then_dead_letter(server):
-    resp = _post_event(server.base_url, "/t/fail-always")
+def test_retries_use_1_2_backoff_then_breaker_delays_last_attempt(server):
+    resp = _post_event(
+        server.base_url, "/t/fail-always", extra_query=f"?nonce={uuid.uuid4().hex}"
+    )
     event_id = resp.json()["id"]
     final = wait_for(
         lambda: (lambda e: e if e["status"] == "dead" else None)(
@@ -153,10 +158,12 @@ def test_retries_use_1_2_4_backoff_then_dead_letter(server):
 
     times = [_parse_iso(a["attempted_at"]) for a in final["attempts"]]
     gaps = [(times[i] - times[i - 1]).total_seconds() for i in range(1, 4)]
-    # Gaps include request latency; allow slack but verify the 1/2/4 schedule.
+    # Gaps include request latency; allow slack but verify the 1/2 schedule.
     assert 0.9 <= gaps[0] <= 2.5, gaps
     assert 1.8 <= gaps[1] <= 3.5, gaps
-    assert 3.6 <= gaps[2] <= 5.5, gaps
+    # The 3rd consecutive failure opened the target's circuit breaker for
+    # ~10s, so the 4th attempt fired only after the cool-down elapsed.
+    assert 8.0 <= gaps[2] <= 13.0, gaps
 
     # Dead-letter events are listed under status=dead.
     dead = httpx.get(f"{server.base_url}/events", params={"status": "dead"}).json()
@@ -213,9 +220,11 @@ def test_events_to_same_endpoint_are_strictly_ordered(server):
 
 def test_earlier_failure_blocks_later_event_until_it_dies(server):
     """While event A retries/dies, B to the same target must not start."""
-    target = f"{server.base_url}/t/fail-always"
+    nonce = uuid.uuid4().hex
+    target = f"{server.base_url}/t/fail-always?nonce={nonce}"
 
-    first = _post_event(server.base_url, "/t/fail-always")
+    first = _post_event(server.base_url, "/t/fail-always",
+                        extra_query=f"?nonce={nonce}")
     first_id = first.json()["id"]
     body = (
         b'{"idempotency_key":"' + uuid.uuid4().hex.encode()
@@ -243,11 +252,13 @@ def test_earlier_failure_blocks_later_event_until_it_dies(server):
             _get_event(server.base_url, first_id)
         ), timeout=30
     )
-    # Only after the first is dead does the second start (and it also fails).
+    # Only after the first is dead does the second start (and it also
+    # fails). The re-opened breaker spaces its attempts ~10s apart, so
+    # allow ample time for it to die.
     final_second = wait_for(
         lambda: (lambda e: e if e["status"] == "dead" else None)(
             _get_event(server.base_url, second_id)
-        ), timeout=30
+        ), timeout=60
     )
     last_attempt_first = _parse_iso(final_first["attempts"][-1]["attempted_at"])
     first_attempt_second = _parse_iso(final_second["attempts"][0]["attempted_at"])
@@ -312,7 +323,9 @@ def test_replay_dead_event_requeues_and_delivers_with_full_history(server):
 
 
 def test_replay_starts_a_fresh_full_backoff_round(server):
-    resp = _post_event(server.base_url, "/t/fail-always")
+    resp = _post_event(
+        server.base_url, "/t/fail-always", extra_query=f"?nonce={uuid.uuid4().hex}"
+    )
     event_id = resp.json()["id"]
     wait_for(
         lambda: (lambda e: e if e["status"] == "dead" else None)(
@@ -322,7 +335,9 @@ def test_replay_starts_a_fresh_full_backoff_round(server):
     )
 
     # Each replay grants a whole new round of 4 attempts (not an instant
-    # re-death), and replay_count accumulates.
+    # re-death), and replay_count accumulates. Once the target's breaker
+    # has opened, every failed attempt re-opens it for ~10s, so each round
+    # takes a while.
     for expected_replays in (1, 2):
         replay = httpx.post(f"{server.base_url}/events/{event_id}/replay")
         assert replay.status_code == 200
@@ -330,19 +345,19 @@ def test_replay_starts_a_fresh_full_backoff_round(server):
             lambda: (lambda e: e if e["status"] == "dead" else None)(
                 _get_event(server.base_url, event_id)
             ),
-            timeout=30,
+            timeout=90,
         )
         assert dead_again["replay_count"] == expected_replays
         assert dead_again["attempts_count"] == 4 * (expected_replays + 1)
 
     final = _get_event(server.base_url, event_id)
     assert [a["attempt_no"] for a in final["attempts"]] == list(range(1, 13))
-    # The last round also followed the 1/2/4 backoff schedule.
+    # With 3+ consecutive failures the target's circuit breaker keeps
+    # re-opening for ~10s after every failed attempt, so the last round's
+    # attempts are spaced by the cool-down rather than the 1/2/4 backoff.
     times = [_parse_iso(a["attempted_at"]) for a in final["attempts"]]
     gaps = [(times[i] - times[i - 1]).total_seconds() for i in range(9, 12)]
-    assert 0.9 <= gaps[0] <= 2.5, gaps
-    assert 1.8 <= gaps[1] <= 3.5, gaps
-    assert 3.6 <= gaps[2] <= 5.5, gaps
+    assert all(8.0 <= g <= 13.0 for g in gaps), gaps
 
 
 def test_replay_rejects_non_dead_and_unknown_events(server):
@@ -676,3 +691,144 @@ def test_processing_event_is_not_interrupted_by_expiry(server):
         timeout=10,
     )
     assert final["attempts_count"] == 1
+
+
+# ------------------------------------------------------------ circuit breaker
+
+def _breaker_entry(base_url: str, target: str) -> dict | None:
+    resp = httpx.get(f"{base_url}/targets/breakers")
+    assert resp.status_code == 200
+    return next(
+        (b for b in resp.json()["breakers"] if b["target"] == target), None
+    )
+
+
+def test_breaker_opens_after_three_failures_then_probe_success_closes(server):
+    # fail_times=3: attempts 1-3 fail (opening the breaker), the half-open
+    # probe (attempt 4) then succeeds and closes it again.
+    target = f"{server.base_url}/t/flaky?fail_times=3&nonce={uuid.uuid4().hex}"
+    resp = _post_event_obj(server.base_url, {
+        "idempotency_key": uuid.uuid4().hex,
+        "target": target,
+        "payload": {},
+    })
+    assert resp.status_code == 201
+    event_id = resp.json()["id"]
+    target = resp.json()["target"]
+
+    # Attempts 1-3 fail on the 1s/2s backoff; the 3rd consecutive failure
+    # opens the breaker for ~10s.
+    wait_for(
+        lambda: (lambda e: e if e["attempts_count"] == 3 else None)(
+            _get_event(server.base_url, event_id)
+        ),
+        timeout=15,
+    )
+    entry = _breaker_entry(server.base_url, target)
+    assert entry is not None
+    assert entry["state"] == "open"
+    assert entry["consecutive_failures"] == 3
+    assert entry["open_remaining_seconds"] > 5
+    assert _parse_iso(entry["open_until"]) > datetime.now(timezone.utc)
+
+    # Without the breaker the 4th attempt would fire ~4s after the 3rd;
+    # while the breaker is open nothing is claimed for this target.
+    time.sleep(5)
+    still = _get_event(server.base_url, event_id)
+    assert still["status"] == "queued"
+    assert still["attempts_count"] == 3
+
+    # After the cool-down the due head event is claimed once as the
+    # half-open probe; it succeeds and the breaker closes.
+    final = wait_for(
+        lambda: (lambda e: e if e["status"] == "delivered" else None)(
+            _get_event(server.base_url, event_id)
+        ),
+        timeout=20,
+    )
+    assert final["attempts_count"] == 4
+    times = [_parse_iso(a["attempted_at"]) for a in final["attempts"]]
+    # The probe was held back by the ~10s cool-down, not the 4s backoff.
+    assert (times[3] - times[2]).total_seconds() >= 8
+
+    entry = _breaker_entry(server.base_url, target)
+    assert entry["state"] == "closed"
+    assert entry["consecutive_failures"] == 0
+    assert entry["open_until"] is None
+
+
+def test_breaker_probe_failure_reopens_is_target_scoped_and_persisted(server):
+    target = f"{server.base_url}/t/fail-always?nonce={uuid.uuid4().hex}"
+    resp = _post_event_obj(server.base_url, {
+        "idempotency_key": uuid.uuid4().hex,
+        "target": target,
+        "payload": {},
+    })
+    assert resp.status_code == 201
+    first_id = resp.json()["id"]
+    target = resp.json()["target"]
+
+    # Attempt 4 is the half-open probe (the breaker opened after attempt
+    # 3); it fails too, so the event dies and the breaker re-opens.
+    dead = wait_for(
+        lambda: (lambda e: e if e["status"] == "dead" else None)(
+            _get_event(server.base_url, first_id)
+        ),
+        timeout=30,
+    )
+    assert dead["attempts_count"] == 4
+    times = [_parse_iso(a["attempted_at"]) for a in dead["attempts"]]
+    # Attempt 4 was delayed by the ~10s cool-down instead of the 4s backoff.
+    assert (times[3] - times[2]).total_seconds() >= 8
+
+    entry = _breaker_entry(server.base_url, target)
+    assert entry["state"] == "open"
+    assert entry["consecutive_failures"] == 4
+
+    # The breaker state lives in SQLite, so a restart re-reads it.
+    import sqlite3
+
+    from app import config as app_config
+
+    raw = sqlite3.connect(app_config.DB_PATH)
+    try:
+        row = raw.execute(
+            "SELECT state, consecutive_failures, open_until_ts "
+            "FROM target_breakers WHERE target = ?",
+            (target,),
+        ).fetchone()
+    finally:
+        raw.close()
+    assert row is not None
+    assert row[0] == "open"
+    assert row[1] == 4
+    assert row[2] > time.time()
+
+    # A second event for the same target is not claimed while the breaker
+    # is open again ...
+    second = _post_event_obj(server.base_url, {
+        "idempotency_key": uuid.uuid4().hex,
+        "target": target,
+        "payload": {},
+    })
+    second_id = second.json()["id"]
+    # ... but other targets keep delivering in parallel.
+    other = _post_event(server.base_url, "/t/record")
+    wait_for(
+        lambda: _get_event(server.base_url, other.json()["id"])["status"]
+        == "delivered",
+        timeout=10,
+    )
+    assert _get_event(server.base_url, second_id)["attempts_count"] == 0
+
+    # After the cool-down the new head event becomes the next probe; it
+    # fails and the breaker opens again.
+    wait_for(
+        lambda: (lambda e: e if e["attempts_count"] >= 1 else None)(
+            _get_event(server.base_url, second_id)
+        ),
+        timeout=20,
+    )
+    entry = _breaker_entry(server.base_url, target)
+    assert entry["state"] == "open"
+    assert entry["consecutive_failures"] == 5

@@ -27,6 +27,17 @@ from . import config
 #                (terminal); never receives an attempt and stops blocking
 #                its endpoint so the next event can proceed. Events already
 #                in ``processing`` are never interrupted by their deadline.
+#
+# Independently of the event lifecycle, each target endpoint has a persisted
+# circuit breaker (table ``target_breakers``):
+#   closed    - normal operation; ``consecutive_failures`` counts failed
+#               attempts since the last 2xx
+#   open      - ``BREAKER_FAILURE_THRESHOLD`` consecutive failures reached;
+#               no event for the target is claimed until ``open_until_ts``
+#   half-open - ``open_until_ts`` has elapsed; the due head event (and only
+#               that one) is claimed as a probe. A 2xx closes the breaker
+#               and zeroes the counter, a failure re-opens it for another
+#               ``BREAKER_OPEN_SECONDS``.
 TERMINAL_STATUSES = ("delivered", "dead", "expired")
 
 
@@ -99,6 +110,15 @@ def init_db() -> None:
                 status_code  INTEGER,
                 error        TEXT,
                 attempted_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS target_breakers (
+                target               TEXT PRIMARY KEY,
+                state                TEXT NOT NULL DEFAULT 'closed',
+                consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                opened_at            TEXT,
+                open_until_ts        REAL,
+                updated_at           TEXT NOT NULL
             );
 
             CREATE INDEX IF NOT EXISTS idx_events_status
@@ -234,12 +254,20 @@ def claim_due_events() -> list[dict]:
        attempt is never interrupted by its deadline.
     2. An event is claimable only when it is ``queued``, its backoff and
        ``deliver_after`` (both folded into ``next_attempt_at``) have
-       elapsed, and no earlier (lower rowid = earlier creation) event for
-       the same target is still ``queued``/``processing``. Claimed events
-       flip to ``processing`` so another tick can never double-claim them.
-       This is the ordering guarantee: a later event cannot be picked while
-       an earlier one is pending — even if that earlier event is merely
-       waiting for its ``deliver_after`` — in flight, or backing off.
+       elapsed, no earlier (lower rowid = earlier creation) event for
+       the same target is still ``queued``/``processing``, and the
+       target's circuit breaker is not in its open cool-down. Claimed
+       events flip to ``processing`` so another tick can never
+       double-claim them. This is the ordering guarantee: a later event
+       cannot be picked while an earlier one is pending — even if that
+       earlier event is merely waiting for its ``deliver_after`` — in
+       flight, or backing off.
+
+    The breaker check (``open`` and ``open_until_ts`` still in the future
+    -> skip the target entirely) is what enforces the half-open rule: once
+    the cool-down has elapsed the target becomes claimable again, and the
+    per-endpoint ordering above guarantees that only the single due head
+    event is picked as the probe while it is in flight.
     """
     now = time.time()
     with db_lock:
@@ -261,9 +289,15 @@ def claim_due_events() -> list[dict]:
                       AND e2.rowid < e.rowid
                       AND e2.status IN ('queued', 'processing')
               )
+              AND NOT EXISTS (
+                    SELECT 1 FROM target_breakers b
+                    WHERE b.target = e.target
+                      AND b.state = 'open'
+                      AND b.open_until_ts > ?
+              )
             ORDER BY e.rowid
             """,
-            (now,),
+            (now, now),
         ).fetchall()
         if rows:
             conn.executemany(
@@ -286,6 +320,9 @@ def record_attempt(
                     a dead event starts a new round: ``attempt_no`` keeps
                     counting up globally, but the backoff schedule and the
                     dead-letter cut-off are relative to the round.
+
+    The target's circuit breaker is updated in the same transaction, so a
+    crash can never record an attempt without its breaker consequence.
     """
     with db_lock:
         conn = get_conn()
@@ -325,8 +362,112 @@ def record_attempt(
                 "next_attempt_at = ? WHERE id = ?",
                 (attempt_no, time.time() + delay, event_id),
             )
+        _apply_breaker_outcome(conn, event["target"], success)
         conn.commit()
         return get_event(event_id)
+
+
+def _apply_breaker_outcome(
+    conn: sqlite3.Connection, target: str, success: bool
+) -> None:
+    """Advance the persisted circuit breaker of ``target`` after an attempt.
+
+    A 2xx closes the breaker and zeroes the consecutive-failure counter.
+    Any other outcome increments it; once the counter reaches
+    ``BREAKER_FAILURE_THRESHOLD`` the breaker opens (or re-opens, when a
+    half-open probe failed) for ``BREAKER_OPEN_SECONDS``. The row is
+    created lazily on the first recorded attempt of a target, so targets
+    without any attempt simply have no row and behave as ``closed``.
+    """
+    now = time.time()
+    now_iso = _iso()
+    if success:
+        conn.execute(
+            "INSERT INTO target_breakers "
+            "(target, state, consecutive_failures, opened_at, open_until_ts, "
+            " updated_at) "
+            "VALUES (?, 'closed', 0, NULL, NULL, ?) "
+            "ON CONFLICT(target) DO UPDATE SET "
+            "state = 'closed', consecutive_failures = 0, "
+            "opened_at = NULL, open_until_ts = NULL, "
+            "updated_at = excluded.updated_at",
+            (target, now_iso),
+        )
+        return
+    row = conn.execute(
+        "SELECT consecutive_failures FROM target_breakers WHERE target = ?",
+        (target,),
+    ).fetchone()
+    failures = (row["consecutive_failures"] if row is not None else 0) + 1
+    if failures >= config.BREAKER_FAILURE_THRESHOLD:
+        conn.execute(
+            "INSERT INTO target_breakers "
+            "(target, state, consecutive_failures, opened_at, open_until_ts, "
+            " updated_at) "
+            "VALUES (?, 'open', ?, ?, ?, ?) "
+            "ON CONFLICT(target) DO UPDATE SET "
+            "state = 'open', "
+            "consecutive_failures = excluded.consecutive_failures, "
+            "opened_at = excluded.opened_at, "
+            "open_until_ts = excluded.open_until_ts, "
+            "updated_at = excluded.updated_at",
+            (target, failures, now_iso, now + config.BREAKER_OPEN_SECONDS, now_iso),
+        )
+    else:
+        conn.execute(
+            "INSERT INTO target_breakers "
+            "(target, state, consecutive_failures, opened_at, open_until_ts, "
+            " updated_at) "
+            "VALUES (?, 'closed', ?, NULL, NULL, ?) "
+            "ON CONFLICT(target) DO UPDATE SET "
+            "state = 'closed', "
+            "consecutive_failures = excluded.consecutive_failures, "
+            "opened_at = NULL, open_until_ts = NULL, "
+            "updated_at = excluded.updated_at",
+            (target, failures, now_iso),
+        )
+
+
+def list_breakers() -> list[dict]:
+    """Return the persisted circuit-breaker state of every known target.
+
+    The stored state is ``closed`` or ``open``. An ``open`` breaker whose
+    cool-down (``open_until_ts``) has already elapsed is reported as
+    ``half_open``: the next due head event of that target will be claimed
+    as the single probe. Only targets with at least one recorded delivery
+    attempt have a row; every other target is implicitly ``closed``.
+    """
+    now = time.time()
+    with db_lock:
+        conn = get_conn()
+        rows = conn.execute(
+            "SELECT * FROM target_breakers ORDER BY target"
+        ).fetchall()
+    breakers = []
+    for row in rows:
+        open_until_ts = row["open_until_ts"]
+        state = row["state"]
+        if state == "open" and open_until_ts is not None and open_until_ts <= now:
+            state = "half_open"
+        breakers.append(
+            {
+                "target": row["target"],
+                "state": state,
+                "consecutive_failures": row["consecutive_failures"],
+                "opened_at": row["opened_at"],
+                "open_until": (
+                    _iso_utc(datetime.fromtimestamp(open_until_ts, timezone.utc))
+                    if open_until_ts is not None
+                    else None
+                ),
+                "open_remaining_seconds": (
+                    max(0.0, open_until_ts - now)
+                    if open_until_ts is not None
+                    else 0.0
+                ),
+            }
+        )
+    return breakers
 
 
 def replay_event(event_id: str) -> dict:

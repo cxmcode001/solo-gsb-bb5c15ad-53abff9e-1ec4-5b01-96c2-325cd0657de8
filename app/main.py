@@ -82,7 +82,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Reliable Webhook Delivery API",
-    version="1.2.0",
+    version="1.3.0",
     description="Sign, enqueue, reliably deliver, replay and inspect webhook events.",
     lifespan=lifespan,
 )
@@ -191,6 +191,21 @@ async def replay_event(event_id: str):
             f"(current status: {exc.status})",
         )
     return _public_event(event)
+
+
+@app.get("/targets/breakers")
+async def list_target_breakers():
+    """List the persisted circuit-breaker state of every known target.
+
+    Each entry carries the target URL, the effective state (``closed`` /
+    ``open`` / ``half_open`` — an ``open`` breaker whose cool-down has
+    elapsed is reported as ``half_open`` and will admit exactly one probe),
+    the current consecutive-failure count and, while open, the ISO-8601
+    cool-down deadline (``open_until``) plus the remaining seconds. The
+    state lives in SQLite, so it survives restarts. Targets without any
+    recorded delivery attempt have no entry and are implicitly ``closed``.
+    """
+    return {"breakers": db.list_breakers()}
 
 
 @app.get("/health")
