@@ -23,5 +23,14 @@ DELIVERY_TIMEOUT = float(os.environ.get("DELIVERY_TIMEOUT", "10"))
 RETRY_BACKOFF = (1.0, 2.0, 4.0)
 MAX_ATTEMPTS = 4
 
+# Per-target circuit breaker. After BREAKER_FAILURE_THRESHOLD consecutive
+# failed deliveries to one target its breaker opens for BREAKER_OPEN_SECONDS,
+# during which no event for that target is claimable. When the deadline has
+# passed, only the due head event may go out as the single half-open probe:
+# a 2xx closes the breaker and clears the failure count, any other outcome
+# reopens it for another BREAKER_OPEN_SECONDS.
+BREAKER_FAILURE_THRESHOLD = int(os.environ.get("BREAKER_FAILURE_THRESHOLD", "3"))
+BREAKER_OPEN_SECONDS = float(os.environ.get("BREAKER_OPEN_SECONDS", "10"))
+
 # Header carrying the hex HMAC-SHA256 signature, prefixed with "sha256=".
 SIGNATURE_HEADER = "X-Webhook-Signature"

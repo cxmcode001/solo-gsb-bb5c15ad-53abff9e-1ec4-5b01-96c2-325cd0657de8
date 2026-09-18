@@ -8,6 +8,7 @@ memory and a crash can never permanently lose or duplicate an event.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import threading
@@ -16,6 +17,8 @@ import uuid
 from datetime import datetime, timezone
 
 from . import config
+
+logger = logging.getLogger("webhook.db")
 
 # Event lifecycle:
 #   queued     - waiting for the first attempt or a retry
@@ -28,6 +31,19 @@ from . import config
 #                its endpoint so the next event can proceed. Events already
 #                in ``processing`` are never interrupted by their deadline.
 TERMINAL_STATUSES = ("delivered", "dead", "expired")
+
+# Per-target circuit-breaker lifecycle:
+#   closed    - deliveries proceed; ``consecutive_failures`` counts the
+#               current run of failed attempts and resets to 0 on any 2xx
+#   open      - the target failed BREAKER_FAILURE_THRESHOLD times in a row;
+#               no event for the target may be claimed until
+#               ``open_until``. Other targets are unaffected
+#   half-open - ``open_until`` has elapsed; exactly one event (the due head
+#               event) has been claimed as a probe and is in flight. While
+#               it runs, nothing else for the target is claimable
+# A 2xx probe closes the breaker; any other outcome reopens it for another
+# full open window. All breaker state lives in the ``breakers`` table, so a
+# restart keeps the deadline counting instead of resetting it.
 
 
 class ReplayNotAllowedError(Exception):
@@ -101,6 +117,14 @@ def init_db() -> None:
                 attempted_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS breakers (
+                target               TEXT PRIMARY KEY,
+                state                TEXT NOT NULL DEFAULT 'closed',
+                consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                open_until_ts        REAL,
+                probe_event_id       TEXT
+            );
+
             CREATE INDEX IF NOT EXISTS idx_events_status
                 ON events(status, next_attempt_at);
             CREATE INDEX IF NOT EXISTS idx_events_target ON events(target);
@@ -145,12 +169,24 @@ def reset_stuck_events() -> None:
     Such an event becomes the blocking head for its endpoint again and is
     safely redelivered. Delivery is at-least-once, which is why outbound
     requests carry an idempotency header.
+
+    If the interrupted attempt was a half-open breaker probe, the breaker
+    cannot keep waiting on a probe that will never return: it reopens with an
+    already-elapsed deadline, so the recovered head event is probed again on
+    the next tick instead of stalling that target forever. Open deadlines are
+    left untouched, so the open window survives the restart exactly as it
+    would have without one.
     """
     with db_lock:
         conn = get_conn()
         conn.execute(
             "UPDATE events SET status = 'queued', next_attempt_at = ? "
             "WHERE status = 'processing'",
+            (time.time(),),
+        )
+        conn.execute(
+            "UPDATE breakers SET state = 'open', open_until_ts = ?, "
+            "probe_event_id = NULL WHERE state = 'half-open'",
             (time.time(),),
         )
         conn.commit()
@@ -225,7 +261,7 @@ def _hydrate(row: sqlite3.Row) -> dict:
 def claim_due_events() -> list[dict]:
     """Atomically claim the head event of every endpoint that is due.
 
-    One transaction, two steps:
+    One transaction, three steps:
 
     1. Every ``queued`` event whose ``expires_at`` has passed is flipped to
        ``expired``. It never receives an attempt and stops blocking its
@@ -240,6 +276,13 @@ def claim_due_events() -> list[dict]:
        This is the ordering guarantee: a later event cannot be picked while
        an earlier one is pending — even if that earlier event is merely
        waiting for its ``deliver_after`` — in flight, or backing off.
+    3. The per-target breaker gates step 2: while it is ``open`` nothing for
+       that target is claimable until ``open_until`` elapses; while it is
+       ``half-open`` a probe is already in flight, so nothing else goes.
+       Once an open deadline has elapsed, the single due head event is
+       claimed and the breaker atomically flips to ``half-open`` with that
+       event recorded as its probe. Different targets stay independent, so
+       a breaker on one endpoint never blocks anyone else.
     """
     now = time.time()
     with db_lock:
@@ -253,8 +296,15 @@ def claim_due_events() -> list[dict]:
         rows = conn.execute(
             """
             SELECT e.* FROM events e
+            LEFT JOIN breakers b ON b.target = e.target
             WHERE e.status = 'queued'
               AND e.next_attempt_at <= ?
+              AND (
+                    b.target IS NULL
+                    OR b.state = 'closed'
+                    OR (b.state = 'open' AND b.open_until_ts IS NOT NULL
+                        AND b.open_until_ts <= ?)
+              )
               AND NOT EXISTS (
                     SELECT 1 FROM events e2
                     WHERE e2.target = e.target
@@ -263,12 +313,21 @@ def claim_due_events() -> list[dict]:
               )
             ORDER BY e.rowid
             """,
-            (now,),
+            (now, now),
         ).fetchall()
         if rows:
             conn.executemany(
                 "UPDATE events SET status = 'processing' WHERE id = ?",
                 [(r["id"],) for r in rows],
+            )
+            # An expired open deadline makes this claim the one and only
+            # half-open probe; closed targets simply keep their state. The
+            # old deadline is cleared: open_until is only meaningful while
+            # the breaker is actually open.
+            conn.executemany(
+                "UPDATE breakers SET state = 'half-open', probe_event_id = ?, "
+                "open_until_ts = NULL WHERE target = ? AND state = 'open'",
+                [(r["id"], r["target"]) for r in rows],
             )
         conn.commit()
         return [_hydrate(r) for r in rows]
@@ -286,6 +345,12 @@ def record_attempt(
                     a dead event starts a new round: ``attempt_no`` keeps
                     counting up globally, but the backoff schedule and the
                     dead-letter cut-off are relative to the round.
+
+    In the same transaction the target's circuit breaker is advanced: a 2xx
+    closes it and zeroes the consecutive-failure counter; any other outcome
+    increments the counter, opens it for ``BREAKER_OPEN_SECONDS`` at the
+    ``BREAKER_FAILURE_THRESHOLD`` consecutive failure, and — when the attempt
+    was a half-open probe — reopens it immediately for another full window.
     """
     with db_lock:
         conn = get_conn()
@@ -325,8 +390,81 @@ def record_attempt(
                 "next_attempt_at = ? WHERE id = ?",
                 (attempt_no, time.time() + delay, event_id),
             )
+        _record_breaker_outcome(conn, event["target"], event_id, success)
         conn.commit()
         return get_event(event_id)
+
+
+def _record_breaker_outcome(
+    conn: sqlite3.Connection, target: str, event_id: str, success: bool
+) -> None:
+    """Advance one target's breaker after an attempt finished.
+
+    Caller holds ``db_lock`` and the surrounding transaction. At most one
+    attempt per target is ever in flight (head-event ordering), so the
+    read-modify-write below cannot race with another attempt to the same
+    target.
+    """
+    row = conn.execute(
+        "SELECT * FROM breakers WHERE target = ?", (target,)
+    ).fetchone()
+    current = dict(row) if row is not None else None
+    was_probe = current is not None and (
+        current["state"] == "half-open" and current["probe_event_id"] == event_id
+    )
+
+    if success:
+        if current is not None and current["state"] != "closed":
+            logger.info("breaker for %s closed after successful probe", target)
+        conn.execute(
+            "INSERT INTO breakers (target, state, consecutive_failures, "
+            "open_until_ts, probe_event_id) VALUES (?, 'closed', 0, NULL, NULL) "
+            "ON CONFLICT(target) DO UPDATE SET state = 'closed', "
+            "consecutive_failures = 0, open_until_ts = NULL, probe_event_id = NULL",
+            (target,),
+        )
+        return
+
+    failures = (current["consecutive_failures"] if current is not None else 0) + 1
+    # A failed half-open probe reopens regardless of the running counter;
+    # ordinary failures open once the threshold is reached.
+    should_open = was_probe or failures >= config.BREAKER_FAILURE_THRESHOLD
+    if should_open:
+        open_until = time.time() + config.BREAKER_OPEN_SECONDS
+        conn.execute(
+            "INSERT INTO breakers (target, state, consecutive_failures, "
+            "open_until_ts, probe_event_id) VALUES (?, 'open', ?, ?, NULL) "
+            "ON CONFLICT(target) DO UPDATE SET state = 'open', "
+            "consecutive_failures = excluded.consecutive_failures, "
+            "open_until_ts = excluded.open_until_ts, probe_event_id = NULL",
+            (target, failures, open_until),
+        )
+        if was_probe:
+            logger.warning(
+                "breaker for %s reopened for %.0fs after failed probe "
+                "(%d consecutive failures)",
+                target,
+                config.BREAKER_OPEN_SECONDS,
+                failures,
+            )
+        else:
+            logger.warning(
+                "breaker for %s opened for %.0fs after %d consecutive failures",
+                target,
+                config.BREAKER_OPEN_SECONDS,
+                failures,
+            )
+    else:
+        # Sub-threshold failure (or a closed breaker with no row yet): keep
+        # counting while the ordinary retry/backoff schedule proceeds.
+        conn.execute(
+            "INSERT INTO breakers (target, state, consecutive_failures, "
+            "open_until_ts, probe_event_id) VALUES (?, 'closed', ?, NULL, NULL) "
+            "ON CONFLICT(target) DO UPDATE SET state = 'closed', "
+            "consecutive_failures = excluded.consecutive_failures, "
+            "open_until_ts = NULL, probe_event_id = NULL",
+            (target, failures),
+        )
 
 
 def replay_event(event_id: str) -> dict:
@@ -425,3 +563,48 @@ def list_events(status: str | None = None, limit: int = 50, offset: int = 0) -> 
             event["attempts"] = _attempts_for(conn, event["id"])
             events.append(event)
         return events
+
+
+def _hydrate_breaker(row: sqlite3.Row) -> dict:
+    """Public breaker representation with a UTC ISO deadline."""
+    open_until_ts = row["open_until_ts"]
+    return {
+        "target": row["target"],
+        "state": row["state"],
+        "consecutive_failures": row["consecutive_failures"],
+        "open_until": (
+            datetime.fromtimestamp(open_until_ts, tz=timezone.utc)
+            .isoformat(timespec="microseconds")
+            if open_until_ts is not None
+            else None
+        ),
+        "probe_event_id": row["probe_event_id"],
+    }
+
+
+def list_breakers(
+    state: str | None = None, target: str | None = None,
+    limit: int = 200, offset: int = 0,
+) -> list[dict]:
+    """Return breaker rows, optionally filtered by state and/or exact target.
+
+    A row exists for every target that has seen at least one delivery
+    attempt, including closed breakers recovering from earlier failures.
+    """
+    limit = max(1, min(limit, 500))
+    clauses: list[str] = []
+    params: list = []
+    if state:
+        clauses.append("state = ?")
+        params.append(state)
+    if target:
+        clauses.append("target = ?")
+        params.append(target)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    with db_lock:
+        conn = get_conn()
+        rows = conn.execute(
+            f"SELECT * FROM breakers {where} ORDER BY target LIMIT ? OFFSET ?",
+            (*params, limit, offset),
+        ).fetchall()
+        return [_hydrate_breaker(r) for r in rows]

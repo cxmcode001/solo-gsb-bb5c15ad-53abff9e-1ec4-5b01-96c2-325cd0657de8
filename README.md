@@ -3,7 +3,9 @@
 一个本地可运行的 Webhook 可靠投递服务：接收带 **目标端点** 和 **幂等键** 的事件，
 校验 HMAC-SHA256 签名后入队，由后台调度器按顺序、带退避重试地向目标端点投递；
 三次重试仍失败则进入死信。支持 **投递时间窗**（`deliver_after` / `expires_at`）：
-可预约首次投递时刻，也可为排队等待设置截止期限。技术栈：**Python · FastAPI · SQLite**。
+可预约首次投递时刻，也可为排队等待设置截止期限。每个目标端点还带有**自动熔断器**：
+连续 3 次投递失败即熔断 10 秒，到期后仅放行队头事件作为唯一 half-open 探针。
+技术栈：**Python · FastAPI · SQLite**。
 
 ## 特性
 
@@ -12,6 +14,8 @@
 - **投递时间窗**：创建事件可携带 RFC 3339 的 `deliver_after`（默认创建时刻，提前到该时刻之前不投递）与 `expires_at`（必须晚于 `deliver_after`，否则 422）。调度器每次领取前在同一事务中把已到 `expires_at` 且仍为 `queued` 的事件标记为 `expired`：不产生任何投递尝试，并不再阻塞同目标的后续事件；已进入 `processing` 的事件不因到期而中断。
 - **同一目标端点严格有序**：以创建顺序（SQLite `rowid`）为准，前一条事件未成功、进入死信或过期前，后一条不会被取出投递——即使前一条只是在等待自己的 `deliver_after`。不同端点之间并行投递，互不阻塞。
 - **重试与死信**：首次立即投递（或按 `deliver_after` 延迟）；失败后分别等待 **1s / 2s / 4s** 重试（共 4 次尝试）；第 4 次仍失败（非 2xx、超时、连接错误）即进入死信（状态 `dead`）。
+- **按目标端点的自动熔断器**：同一目标**连续 3 次**投递失败（非 2xx、超时、连接错误）后进入 **open**，10 秒内该目标的任何事件都不会被领取；熔断到期**且队头事件已到原定投递时间**（退避/`deliver_after`）时，只允许该队头事件作为唯一的 **half-open 探针**领取，其余事件继续排队。探针返回 2xx → 熔断 **closed**、连续失败计数清零；探针失败 → 重新 open 10 秒（计数继续累计）。熔断**只影响出问题的目标**，其他端点照常并行投递。状态（`closed`/`open`/`half-open`）、连续失败数、截止时间与探针事件 id 全部持久化在 SQLite，**重启后继续生效**，并与队头顺序、1/2/4 退避、过期清扫和死信重放完全兼容。
+- **熔断器查询**：`GET /targets/breakers` 返回每个有过投递尝试的目标的当前状态、`consecutive_failures`、open 截止时间（`open_until`，RFC 3339 UTC）与 half-open 探针事件 id（`probe_event_id`），支持按 `state` / `target` 过滤。
 - **死信重放**：`POST /events/{event_id}/replay` 仅接受 `dead` 事件，在一个事务内将其重新入队并开启**新一轮完整**的 1s/2s/4s 退避（再次享有 4 次尝试）。历史 `attempts` 全部保留、`attempt_no` 连续递增，`replay_count` 累计并记录 `last_replayed_at`，幂等键与事件 id 不变；并发重复重放只会生效一次，不会重复投递。
 - **事件查询**：返回每次尝试的时间、HTTP 响应码/错误信息、最终状态（`queued` / `processing` / `delivered` / `dead` / `expired`），时间窗字段 `deliver_after` / `expires_at`，以及 `replay_count` / `last_replayed_at` 重放信息。
 - **崩溃恢复**：投递状态全部在 SQLite（WAL 模式）中，重启后把卡在 `processing` 的事件重新排队；出站请求携带 `X-Event-Id` / `X-Idempotency-Key`，投递语义为 at-least-once。
@@ -33,8 +37,9 @@ docker compose up --build
 | OpenAPI Schema | <http://localhost:8000/openapi.json> |
 
 宿主机端口 `8000`，容器内端口 `8000`（在 `docker-compose.yml` 的 `ports` 中可改）。
-数据（事件、投递尝试、死信与重放记录）持久化在命名卷 `webhook-data`（容器内
-`/data/webhooks.db`）；老版本数据库启动时会自动补齐重放与时间窗相关列，无需手工迁移。
+数据（事件、投递尝试、死信与重放记录、熔断器状态）持久化在命名卷 `webhook-data`（容器内
+`/data/webhooks.db`）；老版本数据库启动时会自动补齐重放、时间窗相关列以及熔断器表，
+无需手工迁移。
 
 生产环境请覆盖默认密钥：
 
@@ -87,6 +92,7 @@ X-Webhook-Signature: sha256=<HMAC_SHA256(secret, 原始请求体) 的十六进�
 - `GET /events/{event_id}` — 查询单个事件，含全部投递尝试
 - `GET /events/key/{idempotency_key}` — 按幂等键查询
 - `GET /events?status=dead&limit=50&offset=0` — 列表，可按状态过滤（`queued` / `processing` / `delivered` / `dead` / `expired`）
+- `GET /targets/breakers?state=open&target=<url>&limit=200&offset=0` — 查询各目标端点的熔断器（见下节）
 
 响应示例（4 次尝试后进入死信）：
 
@@ -134,6 +140,65 @@ X-Webhook-Signature: sha256=<HMAC_SHA256(secret, 原始请求体) 的十六进�
 并发重复重放由条件更新（`UPDATE … WHERE status='dead'`）保证只有一个请求生效，
 其余返回 `409`，**不会重复入队或重复投递**。
 
+### 4. 查询熔断器 `GET /targets/breakers`
+
+返回所有有过投递尝试的目标端点的熔断器状态，支持查询参数：
+
+| 参数 | 说明 |
+| --- | --- |
+| `state` | 可选，仅返回该状态：`open` / `half-open` / `closed`（其他值 `422`） |
+| `target` | 可选，按**完整目标 URL** 精确匹配 |
+| `limit` / `offset` | 可选，分页（`limit` 1–500，默认 200） |
+
+响应示例：
+
+```json
+{
+  "breakers": [
+    {
+      "target": "http://localhost:8000/t/fail-always",
+      "state": "open",
+      "consecutive_failures": 3,
+      "open_until": "2026-09-17T12:27:31.934826+00:00",
+      "probe_event_id": null
+    },
+    {
+      "target": "http://localhost:8000/dev/sink",
+      "state": "half-open",
+      "consecutive_failures": 3,
+      "open_until": null,
+      "probe_event_id": "308e5ff7…"
+    },
+    {
+      "target": "http://localhost:8000/t/record",
+      "state": "closed",
+      "consecutive_failures": 0,
+      "open_until": null,
+      "probe_event_id": null
+    }
+  ],
+  "limit": 200,
+  "offset": 0
+}
+```
+
+字段语义：
+
+- `state`：`closed`（正常，失败计数 < 3）/ `open`（熔断中，截止前不可领取该目标的事件）/ `half-open`（已放行唯一探针事件，正在投递）。
+- `consecutive_failures`：当前连续失败次数；任意一次 2xx 立即清零。
+- `open_until`：open 截止时间（RFC 3339 UTC）；closed / half-open 时为 `null`。
+- `probe_event_id`：half-open 时正在投递的唯一探针事件 id；其他状态为 `null`。
+
+熔断规则：
+
+1. 某目标**连续** `BREAKER_FAILURE_THRESHOLD`（默认 3）次投递失败 → open，截止时间为当前时刻 + `BREAKER_OPEN_SECONDS`（默认 10 秒）。
+2. open 期间调度器不会领取该目标的**任何**事件（其他目标不受影响）；熔断不会中断已在 `processing` 中的投递。
+3. 截止时间过后，仅当**队头**事件本身也已到原定投递时间（1/2/4 退避或 `deliver_after`，以两者较晚者为准）时，该事件才被领取为唯一 half-open 探针；同一目标的其他事件继续严格排队，探针在途时不会被并发领取。
+4. 探针 2xx → closed，计数清零，队列恢复正常；探针失败（非 2xx/超时/连接错误）→ 重新 open 10 秒，随后仍由当时的队头事件作为下一枚探针。
+5. 熔断状态、失败计数与截止时间均在 SQLite `breakers` 表中：重启不会清零计数或提前结束 open 窗口；重启时若发现探针事件因崩溃卡在 `processing`，事件重新排队、熔断器以**已到期的 open** 恢复，下一个 tick 即重新探针，不会永久卡死该目标。
+
+熔断与既有机制的关系：熔断器叠加在事件状态机之上，不改变单次事件的 1/2/4 退避与死信规则——若探针恰好是该轮第 4 次失败，事件照常进入死信（随后可重放），而熔断器同步重新 open；`queued` 事件在 open 期间到达 `expires_at` 仍会正常转为 `expired` 并让位；重放死信事件时若熔断仍 open，事件会排队等到可探针为止。
+
 ### 出站投递格式
 
 服务向 `target` 发送 `POST`（`Content-Type: application/json`），请求体：
@@ -172,6 +237,10 @@ curl -s -X POST "$BASE/events" -H "X-Webhook-Signature: $SIG2" -d "$BODY2"
 # 重放死信事件：重新入队并开启新一轮完整退避（仅 status=dead 允许）
 DEAD_ID=$(curl -s "$BASE/events/key/${KEY}-fail" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
 curl -s -X POST "$BASE/events/$DEAD_ID/replay"
+
+# 观察按目标熔断器：上面连续失败的目标会经历 open（10s）→ half-open（单探针）→ closed
+curl -s "$BASE/targets/breakers"                 # 全部目标
+curl -s "$BASE/targets/breakers?state=open"     # 只看熔断中的目标
 ```
 
 Python 生成签名：
@@ -192,6 +261,8 @@ signature = "sha256=" + hmac.new(
 | `WORKER_POLL_INTERVAL` | `0.2` | 调度器扫描间隔（秒） |
 | `WORKER_MAX_CONCURRENCY` | `8` | 同时进行投递的不同端点数 |
 | `DELIVERY_TIMEOUT` | `10` | 出站 HTTP 超时（秒） |
+| `BREAKER_FAILURE_THRESHOLD` | `3` | 同一目标连续失败多少次后熔断 |
+| `BREAKER_OPEN_SECONDS` | `10` | 熔断打开时长（秒），失败探针重新 open 同样时长 |
 
 重试计划固定为 **1s、2s、4s**（首次失败后），共 4 次尝试；如需调整可修改
 `app/config.py` 中的 `RETRY_BACKOFF` / `MAX_ATTEMPTS`。
@@ -214,6 +285,17 @@ signature = "sha256=" + hmac.new(
 的事件并原子地置为 `processing`；更早的事件仍在 `queued`/`processing` 时，
 后续事件不会被选中，直到前者 `delivered`、`dead` 或 `expired`。
 
+熔断器实现要点：`breakers` 表（`target` 主键）保存 `state` /
+`consecutive_failures` / `open_until_ts`（epoch 秒）/ `probe_event_id`，
+`CREATE TABLE IF NOT EXISTS` 使老库启动即自动获得该表，无需手工迁移。领取事件的
+同一事务会 `LEFT JOIN breakers` 进行门控：无记录或 `closed` 放行；`open` 仅当
+`open_until_ts <= now` 时放行队头，并把该行原子翻转为 `half-open`、记录探针事件 id；
+`half-open`（探针在途）一律不放行。每次投递结果在 `record_attempt` 的**同一事务**
+里更新熔断器：2xx 直接 upsert 为 `closed` 并清零；失败则计数加一，达到阈值或探针
+失败时写入新的 `open_until_ts`，探针失败无论计数多少都会立即重新 open。启动恢复时
+`reset_stuck_events` 保留普通 open 行的截止时间，只把卡在 half-open 的行改为
+**已到期**的 open（探针事件同时重新排队），使该目标下一个 tick 即可重新探针。
+
 ## 运行测试
 
 ```bash
@@ -225,16 +307,19 @@ python -m pytest tests/ -v
 幂等不重复入队、1/2/4 秒退避后死信、失败后恢复、同端点严格有序（含前序失败阻塞后序直到死信）、
 死信重放（完整新退避轮次、历史保留与连续编号、replay_count 累计、非死信 409/未知 404、并发重放仅生效一次）、
 投递时间窗（`deliver_after` 延迟投递且未到时的前序事件仍阻塞同目标后续事件、无效时间窗 422、
-幂等键重复返回原事件、queued 到期转 `expired` 零尝试并让位、`processing` 不受到期影响）。
+幂等键重复返回原事件、queued 到期转 `expired` 零尝试并让位、`processing` 不受到期影响），
+以及按目标熔断器（连续 3 次失败 open、open 期间全目标冻结、到期仅队头作为 half-open
+探针、探针成功 closed 清零/失败重新 open、其他目标并行不受影响、查询接口字段与过滤、
+重启后 open 截止时间保持且崩溃中断的探针自动恢复、默认阈值 3 次/10 秒）。
 
 ## 项目结构
 
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由：签名校验、事件接收、查询、死信重放、dev sink
-│   ├── config.py      # 环境变量配置
-│   ├── db.py          # SQLite 表结构、状态机、有序 claim/幂等查询
+│   ├── main.py        # FastAPI 路由：签名校验、事件接收、查询、死信重放、熔断器查询、dev sink
+│   ├── config.py      # 环境变量配置（含熔断阈值/open 时长）
+│   ├── db.py          # SQLite 表结构、状态机、有序 claim、熔断器状态机、幂等查询
 │   ├── delivery.py    # 出站 HTTP 投递与 HMAC 签名
 │   └── worker.py      # 后台调度器（每端点有序、跨端点线程池并行）
 ├── tests/             # 端到端测试

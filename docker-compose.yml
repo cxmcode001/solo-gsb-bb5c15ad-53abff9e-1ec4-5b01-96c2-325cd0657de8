@@ -11,11 +11,15 @@ services:
       WEBHOOK_DB_PATH: "/data/webhooks.db"
       WORKER_POLL_INTERVAL: "0.2"
       DELIVERY_TIMEOUT: "10"
+      # Per-target circuit breaker: 3 consecutive failures open it for 10s.
+      BREAKER_FAILURE_THRESHOLD: "${BREAKER_FAILURE_THRESHOLD:-3}"
+      BREAKER_OPEN_SECONDS: "${BREAKER_OPEN_SECONDS:-10}"
     volumes:
-      # Persists events, delivery attempts and dead-letter/replay state
-      # (replay_count, last_replayed_at, deliver_after, expires_at).
+      # Persists events, delivery attempts, dead-letter/replay state and
+      # per-target breaker state (state, failure count, open deadline).
       # Older databases are migrated in place on startup — the replay and
-      # delivery-window columns are added automatically.
+      # delivery-window columns and the breakers table are added
+      # automatically.
       - webhook-data:/data
     restart: unless-stopped
 

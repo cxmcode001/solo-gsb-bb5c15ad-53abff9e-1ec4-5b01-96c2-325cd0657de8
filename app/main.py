@@ -82,8 +82,9 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Reliable Webhook Delivery API",
-    version="1.2.0",
-    description="Sign, enqueue, reliably deliver, replay and inspect webhook events.",
+    version="1.3.0",
+    description="Sign, enqueue, reliably deliver, replay and inspect webhook events, "
+    "with persistent per-target circuit breakers.",
     lifespan=lifespan,
 )
 
@@ -191,6 +192,30 @@ async def replay_event(event_id: str):
             f"(current status: {exc.status})",
         )
     return _public_event(event)
+
+
+@app.get("/targets/breakers")
+async def get_target_breakers(
+    state: str | None = Query(
+        None, pattern="^(open|half-open|closed)$",
+        description="Only return breakers in this state.",
+    ),
+    target: str | None = Query(None, description="Filter by exact target URL."),
+    limit: int = Query(200, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    """Report the persistent per-target circuit breakers.
+
+    Every target that has seen a delivery attempt appears once, with its
+    current ``state`` (``closed`` / ``open`` / ``half-open``), the
+    ``consecutive_failures`` counter that drives opening, the ``open_until``
+    deadline of an open breaker (RFC 3339 UTC, ``null`` otherwise) and the
+    ``probe_event_id`` of the single event probing a half-open breaker.
+    State and deadlines survive restarts — they are read straight from
+    SQLite.
+    """
+    breakers = db.list_breakers(state=state, target=target, limit=limit, offset=offset)
+    return {"breakers": breakers, "limit": limit, "offset": offset}
 
 
 @app.get("/health")

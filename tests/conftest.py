@@ -7,6 +7,9 @@ os.environ["WEBHOOK_SECRET"] = "test-secret"
 os.environ["WEBHOOK_DB_PATH"] = os.path.join(_tmpdir, "test.db")
 os.environ["WORKER_POLL_INTERVAL"] = "0.05"
 os.environ["DELIVERY_TIMEOUT"] = "5"
+# Short open window so the breaker's 1/2/4s backoff schedule (already
+# larger than the window) dominates the existing retry-timing tests.
+os.environ["BREAKER_OPEN_SECONDS"] = "1"
 
 import socket
 import threading
@@ -71,6 +74,8 @@ from fastapi.responses import JSONResponse as FastAPIJSONResponse  # noqa: E402
 receipts: list[dict] = []
 _fail_counts: dict[str, int] = {}
 _gates: dict[str, threading.Event] = {}
+_probe_counts: dict[str, int] = {}
+_probe_gates: dict[str, threading.Event] = {}
 
 
 def _register_test_sinks(application) -> None:
@@ -141,6 +146,38 @@ def _register_test_sinks(application) -> None:
         if _fail_counts[event_id] <= fail_times:
             return FastAPIJSONResponse({"ok": False}, status_code=500)
         return FastAPIJSONResponse({"ok": True})
+
+    @application.post("/t/probe")
+    async def t_probe(
+        request: FastAPIRequest,
+        fail_times: int = 0,
+        gate: str | None = None,
+    ):
+        # Circuit-breaker driving sink, keyed per target URL (its query
+        # string encodes fail_times/gate so parallel tests never collide).
+        # Fails the first ``fail_times`` calls on this exact URL; the next
+        # call blocks until the named gate is released, then answers 200 —
+        # letting a test hold the single half-open probe in flight and
+        # inspect the breaker state. Without a gate it simply keeps failing.
+        url = str(request.url.path)
+        if request.url.query:
+            url = f"{url}?{request.url.query}"
+        seen = _probe_counts.get(url, 0) + 1
+        _probe_counts[url] = seen
+        if seen <= fail_times:
+            return FastAPIJSONResponse({"ok": False, "n": seen}, status_code=500)
+        if gate is not None:
+            event = _probe_gates.setdefault(gate, threading.Event())
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, event.wait, 30)
+        else:
+            return FastAPIJSONResponse({"ok": False, "n": seen}, status_code=500)
+        return FastAPIJSONResponse({"ok": True, "n": seen})
+
+    @application.post("/t/probe-release")
+    async def t_probe_release(gate: str):
+        _probe_gates.setdefault(gate, threading.Event()).set()
+        return FastAPIJSONResponse({"released": True})
 
 
 
